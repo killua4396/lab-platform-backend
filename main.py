@@ -18,12 +18,12 @@ async def get_lithium_data():
 async def get_fuel_data():
     pass
 
-# 锂电池包数学建模 -- 高晋源
+# 锂电池包数学建模 -- 高晋源，陆晓蒙
 @app.get("/model/lithum")
 async def run_lithium_model():
     pass
 
-# 燃料电池系统数学建模 -- 陆晓蒙
+# 燃料电池系统数学建模 -- 刘俊，李泽宇
 @app.get("/model/fuel")
 async def run_fuel_model():
     pass
@@ -38,7 +38,7 @@ async def run_car_model():
 async def run_genetic_algorithm():
     pass
 
-# 给予马尔科夫链预测模型的车辆速度预测算法 -- 刘俊
+# 基于马尔科夫链预测模型的车辆速度预测算法 -- 刘俊
 @app.get("/algorithm/car/speed_predition/markov")
 async def run_markov_algorithm():
     pass
