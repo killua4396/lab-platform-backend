@@ -1,10 +1,14 @@
 from infrastructure.queries import get_fuel_cell_data
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from scipy.spatial.distance import cdist
+from matplotlib import rcParams
 import matplotlib.pyplot as plt
 from pydantic import BaseModel
 from typing import Optional
+from PyEMD import CEEMDAN
+from io import BytesIO
 import pandas as pd
 import numpy as np
 import scipy.io
@@ -21,6 +25,18 @@ try:
     kmeans_centers = scipy.io.loadmat('./modules/Cluster_Centers.mat')['centers']
 except FileNotFoundError as e:
     raise RuntimeError(f"模型加载失败: {e}")
+
+try:
+    ceshi_urban_con = scipy.io.loadmat('./modules/ceshi_urban_con.mat')['ceshi_urban_con']
+    pro_mat = scipy.io.loadmat('./modules/Pro_urban_con_total.mat')
+    Pro_matlab = pro_mat['Pro']
+    
+    Pro = np.zeros((50, 71, 55, 55))
+    for k in range(50):
+        for n in range(71):
+            Pro[k, n, :, :] = Pro_matlab[k][n]
+except Exception as e:
+    raise RuntimeError(f"数据加载失败: {str(e)}")
 
 def remove_empty_values(data):
     """
@@ -675,7 +691,134 @@ async def run_fault_detection():
 # 锂电池健康状态估计算法 -- 张颖
 @app.get("/algorithm/lithium/soh")
 async def run_soh_calculation():
-    pass
+    df = pd.read_csv('dataset/#2.csv', index_col=0)
+    df['record_time'] = pd.to_datetime(df['record_time'].astype(str).str.slice(0, 14),
+                                       format='%Y%m%d%H%M%S').dt.strftime('%Y-%m-%d %H:%M:%S')
+    df['record_time'] = pd.to_datetime(df['record_time'])  # 转换为datetime类型
+    df['date'] = df['record_time'].dt.date  # df将会包含一个新的date列，其中每个数据表示该行数据所属的日期。
+    df['charge_current (A)'] = -df['charge_current (A)']
+
+    # 过滤出每一个连续的充电片段：
+    diff_time = 300
+    charge_data = df
+    # 定义一个列表，用于存储每个连续的充电片段的起始和结束时间
+    charge_segments = []
+    # 遍历数据，判断每个数据点是否为连续的充电片段的结束点
+    for i in range(len(charge_data) - 1):
+        if (charge_data.iloc[i + 1]['record_time'] - charge_data.iloc[i]['record_time']).seconds > diff_time or \
+                charge_data.iloc[i + 1]['record_time'].date() != charge_data.iloc[i]['record_time'].date():
+            # 如果当前数据点与下一个数据点的时间差大于diff_time秒，或者日期不一致，则认为当前数据点是充电片段的结束点
+            charge_segments.append((charge_data.iloc[i]['record_time'], charge_data.iloc[i + 1]['record_time']))
+    # 给每个连续的充电片段进行索引，添加到新的列中
+    charge_segment_index = []
+    segment_count = 1
+    for i in range(len(charge_data)):
+        if i == 0:
+            charge_segment_index.append(segment_count)
+        elif (charge_data.iloc[i]['record_time'] - charge_data.iloc[i - 1]['record_time']).seconds > diff_time:
+            segment_count += 1
+            charge_segment_index.append(segment_count)
+        else:
+            charge_segment_index.append(segment_count)
+    # 将索引列添加到dataframe中
+    charge_data['charge_segment_index'] = charge_segment_index
+
+    charge_data = charge_data.reset_index(drop=True)
+    len(charge_data['date'].unique()), len(charge_data['charge_segment_index'].unique())
+    # 充电片段中天数和连续充电片段的个数，肯定是前者小于后者，因为一天可能有多个充电片段
+    # 获取所有连续充电片段的索引值
+    segment_indices = charge_data['charge_segment_index'].unique()
+    # 遍历每个连续充电片段的索引值，获取该片段的SOC起始值和SOC终值
+    start_time_list = []
+    end_time_list = []
+    start_soc_list = []
+    end_soc_list = []
+    for index in segment_indices:
+        segment_data = charge_data[charge_data['charge_segment_index'] == index]
+        start_time = segment_data.iloc[0]['record_time']
+        start_time_list.append(start_time)
+        end_time = segment_data.iloc[-1]['record_time']
+        end_time_list.append(end_time)
+        start_soc = segment_data.iloc[0]['soc']
+        start_soc_list.append(start_soc)
+        end_soc = segment_data.iloc[-1]['soc']
+        end_soc_list.append(end_soc)
+
+    start_soc_series = pd.Series(start_soc_list)
+    end_soc_series = pd.Series(end_soc_list)
+    # 筛选出 end_soc_series-start_soc_series 大于等于40 的索引
+    filtered_index = (end_soc_series - start_soc_series >= 40)
+
+    index_list = filtered_index[filtered_index == True].index.tolist()
+    new_index_list = [i + 1 for i in index_list]  # 第一个数据的索引为1，所以这里所有索引+1
+
+    filtered_index = charge_data['charge_segment_index'].isin(new_index_list)
+    # 使用 filtered_index 对 charge_data 进行索引，得到符合条件的行
+    filtered_data = charge_data[filtered_index]
+    filtered_data['charge_segment_index'].unique()
+
+    len(filtered_data['charge_segment_index'].unique()), len(new_index_list)  # 过滤后存在的片段序号和new_index_list相同，过滤成功
+    filtered_data = filtered_data.reset_index(drop=True)
+    # 假设 filtered_data 是符合条件的行所组成的 DataFrame
+    # 使用布尔索引将 soc < 30 或 soc > 80 的数据剔除
+    filtered_data = filtered_data[(filtered_data['soc'] >= 30) & (filtered_data['soc'] <= 80)]
+
+    len(filtered_data['charge_segment_index'].unique())
+    filtered_data = filtered_data.reset_index(drop=True)
+    start_time = filtered_data.groupby('charge_segment_index')['record_time'].first()
+    end_time = filtered_data.groupby('charge_segment_index')['record_time'].last()
+    seconds = (end_time - start_time).dt.total_seconds()
+    # 计算每个分组的 delta_soc 值
+    delta_soc = filtered_data.groupby('charge_segment_index')['soc'].last() - \
+                filtered_data.groupby('charge_segment_index')['soc'].first()
+    # 计算每个分组的 i 值
+    i = filtered_data.groupby('charge_segment_index')['charge_current (A)'].mean()
+    # 计算容量估计值
+    capacity_estimate = (seconds / 3600) * np.abs(i) / (delta_soc / 100)
+    capacity_arr = np.array(capacity_estimate)
+    # 找出异常值的索引
+    outlier_idx = np.where((capacity_arr < np.mean(capacity_arr) - 3 * np.std(capacity_arr)) | (
+                capacity_arr > np.mean(capacity_arr) + 3 * np.std(capacity_arr)))[0]
+    # 用前后两个值的平均值对异常值进行填充
+    for idx in outlier_idx:
+        capacity_arr[idx] = (capacity_arr[idx - 1] + capacity_arr[idx + 1]) / 2
+    capacity_estimate = capacity_arr
+    plt.show()
+
+    emd = CEEMDAN()
+    IMF = emd.ceemdan(capacity_estimate)
+    N = IMF.shape[0] + 1
+
+    rcParams['font.family'] = 'sans-serif'
+    rcParams['font.sans-serif'] = ['SimSun', 'Arial']
+
+    capacity_estimate = capacity_arr
+    fig = plt.figure(figsize=(6, 4), dpi=600)
+    plt.plot(capacity_estimate, color='gray', alpha=0.4, label='平滑前的容量衰减曲线')
+    plt.plot(IMF[-1], color='black', linestyle='--', label='平滑后的容量衰减曲线')
+    plt.xlabel('充电循环', fontsize=10)
+    plt.ylabel('容量估计值', fontsize=10)
+    plt.legend(loc='upper right', fontsize=8)
+
+    # 保存图像到字节流
+    img_buffer = BytesIO()
+    plt.savefig(img_buffer, format="png")  # 保存为 PNG 格式
+    img_buffer.seek(0)  # 将指针移到字节流的开头
+
+    # 关闭绘图
+    plt.close(fig)
+
+    # 返回图像
+    return StreamingResponse(img_buffer, media_type="image/png")
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=8000)
